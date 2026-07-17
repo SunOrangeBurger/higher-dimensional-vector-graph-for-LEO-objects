@@ -30,6 +30,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
 import orbital_physics as op
+import data_generator as gen
 
 try:
     import torch
@@ -46,6 +47,9 @@ FALLBACK_NPZ_PATH = "outputs/leo_embeddings.npz"
 
 N_OBJECTS = None
 EMBED_FRACTION = 0.5     # fraction of the catalog the ground station "knows about"
+                          # -- set to 0.0 (or pass --cold-start on the CLI)
+                          # for a true cold start: no pre-known catalog at
+                          # all (see ISSUES_AND_UPGRADE_PATH.md #1).
 SEED = 42
 
 OBJECT_TYPES = ["satellite", "debris", "rocket_body"]
@@ -131,7 +135,90 @@ def fit_scalers(df: pd.DataFrame) -> dict:
         "e_log_mean": float(e_scaler.mean_[0]), "e_log_std": float(e_scaler.scale_[0]),
         "size_log_mean": float(size_scaler.mean_[0]), "size_log_std": float(size_scaler.scale_[0]),
         "rcs_log_mean": float(rcs_scaler.mean_[0]), "rcs_log_std": float(rcs_scaler.scale_[0]),
+        "source": "fitted",
     }
+
+
+def build_domain_default_scalers() -> dict:
+    """
+    Cold-start scaler fallback: StandardScaler needs data to fit on, and at
+    true cold start the embedded catalog is empty. Derive placeholder
+    mean/std from the physical ranges data_generator.py already defines
+    (LEO_ALT_MIN/MAX, SIZE_RANGES, RCS_RANGES) instead of leaving the store
+    without scalers at all.
+
+    This is a reasonable PRIOR, not a measurement -- callers should refit
+    real scalers (fit_scalers) once enough objects have been registered and
+    swap them in (see refit_scalers_in_place), which is why this payload is
+    tagged source="domain_default" rather than "fitted": every downstream
+    consumer reads `scalers` fresh from the store/catalog object each call,
+    so replacing the dict in place is all that's needed -- no matching code
+    has to change.
+
+    Uses a uniform-distribution midpoint/spread approximation: for a
+    uniform range [lo, hi], mean=(lo+hi)/2 and std=(hi-lo)/sqrt(12). Since
+    size/rcs/eccentricity are modeled log1p-transformed elsewhere, the
+    range is derived in log1p space here too, using a representative
+    (type-weighted) blend across object types since cold start has no type
+    distribution yet to condition on.
+    """
+    a_lo = gen.EARTH_RADIUS_KM + gen.LEO_ALT_MIN
+    a_hi = gen.EARTH_RADIUS_KM + gen.LEO_ALT_MAX
+    a_mean = (a_lo + a_hi) / 2.0
+    a_std = (a_hi - a_lo) / np.sqrt(12)
+
+    # Eccentricity: data_generator draws ~90% near-circular (0.0001-0.01)
+    # and ~10% elliptical (0.01-0.15) -- blend those two bands weighted the
+    # same way sample_eccentricity() does, in log1p space.
+    e_lo_log, e_hi_log = np.log1p(0.0001), np.log1p(0.15)
+    e_log_mean = 0.9 * np.log1p(0.005) + 0.1 * np.log1p(0.08)
+    e_log_std = (e_hi_log - e_lo_log) / np.sqrt(12)
+
+    # Size / RCS: blend the per-type ranges by TYPE_WEIGHTS, in log1p space.
+    def _blended_log_stats(ranges: dict) -> tuple:
+        los, his = [], []
+        for t, w in zip(gen.OBJECT_TYPES, gen.TYPE_WEIGHTS):
+            lo, hi = ranges[t]
+            los.append(np.log1p(lo) * w)
+            his.append(np.log1p(hi) * w)
+        lo_log, hi_log = sum(los), sum(his)
+        mean_log = (lo_log + hi_log) / 2.0
+        std_log = (hi_log - lo_log) / np.sqrt(12)
+        return mean_log, max(std_log, 1e-6)  # floor std to avoid div-by-zero
+
+    size_log_mean, size_log_std = _blended_log_stats(gen.SIZE_RANGES)
+    rcs_log_mean, rcs_log_std = _blended_log_stats(gen.RCS_RANGES)
+
+    return {
+        "a_mean": float(a_mean), "a_std": float(a_std),
+        "e_log_mean": float(e_log_mean), "e_log_std": float(e_log_std),
+        "size_log_mean": float(size_log_mean), "size_log_std": float(size_log_std),
+        "rcs_log_mean": float(rcs_log_mean), "rcs_log_std": float(rcs_log_std),
+        "source": "domain_default",
+    }
+
+
+def refit_scalers_in_place(cat_a, cat_e, cat_size, cat_rcs, min_n=50):
+    """
+    Produce real fitted scalers once enough objects have been registered to
+    fit on (see ISSUES_AND_UPGRADE_PATH.md #1). Returns None if
+    len(cat_a) < min_n (not enough data yet -- caller should keep using its
+    current scalers). Otherwise returns a NEW scalers dict (source=
+    "fitted") that the caller should swap its live `scalers` reference to;
+    every consumer reads `scalers` fresh each call, so no matching/
+    embedding code needs to change when this swap happens.
+    """
+    n = len(cat_a)
+    if n < min_n:
+        return None
+
+    df = pd.DataFrame({
+        "a": np.asarray(cat_a, dtype=float),
+        "e": np.asarray(cat_e, dtype=float),
+        "size_meters": np.asarray(cat_size, dtype=float),
+        "rcs": np.asarray(cat_rcs, dtype=float),
+    })
+    return fit_scalers(df)
 
 
 def transform_identity_vector(a, e, i_deg, raan_deg, argp_deg, obj_type, size_m, rcs, scalers: dict):
@@ -201,9 +288,65 @@ def build_embeddings(df: pd.DataFrame, scalers: dict) -> np.ndarray:
     ]).astype(np.float32)
 
 
+def build_empty_scaffold_store() -> dict:
+    """
+    Cold-start entry point: construct the exact same dict SHAPE main()
+    would normally write to disk, but with zero-length arrays for every
+    catalog-sized field. This means every downstream consumer
+    (LiveCatalogANNIndex, calibrate_thresholds(), the matching loop in
+    ground_station_tracking_simulation.py) sees a structurally valid,
+    merely-empty catalog rather than a special case to branch on -- no
+    consumer needs an "is this cold start?" check, it just naturally
+    iterates zero times / falls back to its existing "n_cat == 0" or
+    "n_cat <= candidate_pool_size" handling.
+
+    The one field that can't come from an empty catalog is `scalers`
+    (StandardScaler needs data) -- use build_domain_default_scalers()
+    instead, flagged scalers["source"]="domain_default" so it's visible
+    downstream and swappable later (see refit_scalers_in_place).
+    """
+    scalers = build_domain_default_scalers()
+    return {
+        "names": [],
+        "vectors": np.zeros((0, len(IDENTITY_DIMENSIONS)), dtype=np.float32),
+        "dimensions": IDENTITY_DIMENSIONS,
+        "scalers": scalers,
+        "elements_a": np.zeros(0, dtype=float),
+        "elements_e": np.zeros(0, dtype=float),
+        "elements_i": np.zeros(0, dtype=float),
+        "elements_raan": np.zeros(0, dtype=float),
+        "elements_argp": np.zeros(0, dtype=float),
+        "bc_m2_per_kg": np.zeros(0, dtype=float),
+        "types": [],
+        "sizes": np.zeros(0, dtype=float),
+        "rcs": np.zeros(0, dtype=float),
+        "epoch_seconds": np.zeros(0, dtype=float),
+        "distance_weights": DISTANCE_WEIGHTS,
+    }
+
+
 def main():
     catalog_df = pd.read_csv(CATALOG_INPUT_PATH)
     full_count = len(catalog_df)
+
+    if EMBED_FRACTION == 0.0:
+        # True cold start: no pre-known catalog at all. Still write a store
+        # file (with the empty-scaffold shape) so load_embedding_store() in
+        # the tracking sim has a single, uniform load path either way.
+        print(f"Catalog has {full_count} objects; EMBED_FRACTION=0.0 -- cold start, "
+              f"embedding 0 of them (0%).")
+        payload = build_empty_scaffold_store()
+        print("Wrote cold-start scaffold: 0 pre-known objects, domain-default scalers "
+              f"(source={payload['scalers']['source']}).")
+        if TORCH_AVAILABLE:
+            payload["vectors"] = torch.from_numpy(payload["vectors"])
+            torch.save(payload, OUTPUT_PATH)
+            print(f"Wrote PyTorch scaffold file to {OUTPUT_PATH}")
+        else:
+            np.savez(FALLBACK_NPZ_PATH, **{k: (v if not isinstance(v, dict) else np.array([v], dtype=object))
+                                            for k, v in payload.items()})
+            print(f"torch not available -- wrote fallback scaffold {FALLBACK_NPZ_PATH} instead.")
+        return
 
     if N_OBJECTS is not None:
         catalog_df = catalog_df.head(N_OBJECTS).reset_index(drop=True)
@@ -256,4 +399,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Build the LEO catalog embedding store.")
+    parser.add_argument("--cold-start", action="store_true",
+                         help="Build an empty scaffold store (0 pre-known objects) "
+                              "instead of embedding EMBED_FRACTION of the catalog.")
+    args = parser.parse_args()
+    if args.cold_start:
+        EMBED_FRACTION = 0.0
     main()

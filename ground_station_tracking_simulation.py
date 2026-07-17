@@ -177,11 +177,70 @@ ANN_CANDIDATE_POOL_SIZE = leo_ann_index.CANDIDATE_POOL_SIZE
 # fallback internally, this is just for visibility/tuning here).
 ANN_MIN_CATALOG_SIZE = ANN_CANDIDATE_POOL_SIZE
 
+# ---------------------------------------------------------------------
+# Cold start (see ISSUES_AND_UPGRADE_PATH.md #1)
+# ---------------------------------------------------------------------
+# A true cold-start deployment has no pre-known catalog at all -- every
+# object starts "unknown" and has to earn its way in via repeated
+# corroborated sightings. load_embedding_store() below transparently
+# accepts either a normally-built store (some fraction pre-known) or the
+# empty scaffold leo_catalog_embed.py writes when run with --cold-start /
+# EMBED_FRACTION=0.0 -- both have the identical dict shape, so nothing
+# downstream needs to branch on which one it got.
+
+# New-object REGISTRATION requires this many corroborating detections
+# landing on the same pending candidate before a catalog slot is actually
+# minted -- the same "wait for a second agreeing observation" idea already
+# used for belief UPDATES (UPDATE_CONFIRMATIONS_REQUIRED), just applied one
+# step earlier in the pipeline so a cold-start flood of first-pass
+# registrations can't poison the catalog with noise-driven duplicates.
+# 1 = old (unsafe at cold start) behavior: any GNN-confirmed "unknown"
+#     immediately mints a new slot.
+REGISTRATION_CONFIRMATIONS_REQUIRED = 2
+
+# Below this many registered catalog objects, auto-calibration
+# (calibrate_thresholds) is skipped in favor of a wide, deliberately
+# permissive fallback -- with only a handful of objects registered, most
+# "clusters" have 0-1 members and the percentile calculation falls back to
+# the noisy global case, producing thresholds that don't reflect the
+# catalog's eventual (post-warm-up) density. Chosen so that at least a few
+# objects land in most of the catalog's inclination/type/eccentricity
+# buckets before trusting a measured percentile.
+MIN_CATALOG_SIZE_FOR_CALIBRATION = 200
+# Fallback (DRIFT_TOLERANCE, MARGIN_REQUIRED) used below
+# MIN_CATALOG_SIZE_FOR_CALIBRATION -- deliberately wide/permissive so early
+# objects aren't wrongly rejected while the catalog is too sparse to
+# measure real density. These are generous relative to the typical
+# calibrated values (~0.05-0.15 / ~0.02-0.06) seen once the catalog warms
+# up, so early false-rejects are far more likely than early false-accepts.
+SPARSE_CATALOG_FALLBACK_DRIFT_TOLERANCE = 0.5
+SPARSE_CATALOG_FALLBACK_MARGIN_REQUIRED = 0.05
+
+# Refit real scalers (StandardScaler fit on the growing catalog) once this
+# many objects have been registered, replacing the domain-default cold-
+# start prior. See leo_catalog_embed.refit_scalers_in_place.
+MIN_CATALOG_SIZE_FOR_SCALER_REFIT = 50
+
 
 # ---------------------------------------------------------------------
 # Load embedding store
 # ---------------------------------------------------------------------
 def load_embedding_store(pt_path, npz_fallback):
+    """
+    Loads a pre-built store, if one exists. This covers BOTH:
+      - a normally-built store (some EMBED_FRACTION of the catalog
+        pre-known), and
+      - the empty scaffold leo_catalog_embed.py writes when run with
+        --cold-start / EMBED_FRACTION=0.0 (identical dict shape, just
+        zero-length catalog-sized arrays).
+    Both come back from this function in exactly the same shape, so no
+    downstream consumer needs to branch on which one it got.
+
+    If NEITHER file exists (no store has ever been built), fall back to
+    constructing the empty scaffold directly in-process rather than
+    failing -- this is the true "never ran leo_catalog_embed.py at all"
+    cold-start entry point (see ISSUES_AND_UPGRADE_PATH.md #1).
+    """
     if TORCH_AVAILABLE:
         try:
             data = torch.load(pt_path, weights_only=False)
@@ -189,12 +248,18 @@ def load_embedding_store(pt_path, npz_fallback):
             return data
         except FileNotFoundError:
             pass
-    raw = np.load(npz_fallback, allow_pickle=True)
-    data = {k: raw[k] for k in raw.files}
-    data["scalers"] = raw["scalers"][0]  # unwrap the object-array wrapping used in the npz fallback
-    data["names"] = data["names"].tolist()
-    data["types"] = data["types"].tolist()
-    return data
+    try:
+        raw = np.load(npz_fallback, allow_pickle=True)
+        data = {k: raw[k] for k in raw.files}
+        data["scalers"] = raw["scalers"][0]  # unwrap the object-array wrapping used in the npz fallback
+        data["names"] = data["names"].tolist()
+        data["types"] = data["types"].tolist()
+        return data
+    except FileNotFoundError:
+        print(f"No embedding store found at {pt_path} or {npz_fallback} -- "
+              f"starting from an in-process cold-start scaffold "
+              f"(0 pre-known objects, domain-default scalers).")
+        return embed_mod.build_empty_scaffold_store()
 
 
 def calibrate_thresholds(catalog_vectors: np.ndarray, cat_i=None, cat_types=None, cat_e=None):
@@ -292,12 +357,26 @@ def main():
     drift_tolerance = DRIFT_TOLERANCE
     margin_required = MARGIN_REQUIRED
     if drift_tolerance is None or margin_required is None:
-        drift_tolerance, margin_required = calibrate_thresholds(
-            weighted_store_vectors,
-            cat_i=store["elements_i"],
-            cat_types=store["types"],
-            cat_e=store["elements_e"],
-        )
+        if len(store["names"]) < MIN_CATALOG_SIZE_FOR_CALIBRATION:
+            # Sparse/empty catalog (cold start, or early warm-up): a
+            # measured percentile here is noise, not signal -- most
+            # buckets have 0-1 members. Use a deliberately wide/permissive
+            # fallback instead so early objects aren't wrongly rejected
+            # while there isn't enough density to measure yet. See
+            # ISSUES_AND_UPGRADE_PATH.md #1.
+            drift_tolerance = SPARSE_CATALOG_FALLBACK_DRIFT_TOLERANCE
+            margin_required = SPARSE_CATALOG_FALLBACK_MARGIN_REQUIRED
+            print(f"Catalog has only {len(store['names'])} pre-known objects "
+                  f"(< {MIN_CATALOG_SIZE_FOR_CALIBRATION}) -- skipping auto-calibration, "
+                  f"using sparse-catalog fallback thresholds: "
+                  f"DRIFT_TOLERANCE={drift_tolerance}, MARGIN_REQUIRED={margin_required}")
+        else:
+            drift_tolerance, margin_required = calibrate_thresholds(
+                weighted_store_vectors,
+                cat_i=store["elements_i"],
+                cat_types=store["types"],
+                cat_e=store["elements_e"],
+            )
 
     print(f"Catalog:   {len(catalog_df)} objects ({CATALOG_PATH})")
     print(f"Embedding: {len(store['names'])} objects on record")
@@ -307,10 +386,30 @@ def main():
           f"matching accepts on the same slot before a belief-update commits")
 
     gnn_model = None
+    # Minimum pre-known catalog size needed before the GNN has anything
+    # meaningful to train on -- generate_training_examples samples "known"
+    # examples FROM the catalog itself (rng.integers(0, n_cat)) and needs a
+    # non-trivial top5 to build training graphs from. At true cold start
+    # (n_cat=0) there's nothing to train on yet; defer training until
+    # enough objects have been registered via corroborated GNN-confirmed
+    # discoveries during warm-up (see ISSUES_AND_UPGRADE_PATH.md #1). Until
+    # then, rejected detections simply register as new catalog entries
+    # (subject to REGISTRATION_CONFIRMATIONS_REQUIRED) without a GNN second
+    # opinion -- exactly matching what happens today when PyTorch isn't
+    # available at all.
+    MIN_CATALOG_SIZE_FOR_GNN_TRAINING = 50
+    gnn_deferred = False
     if USE_GNN_CONFIRMATION:
         if not gnn_mod.TORCH_AVAILABLE:
             print("GNN confirmation requested but PyTorch isn't available -- skipping "
                   "(rejected detections will just stay NOT KNOWN, no catalog growth).")
+        elif len(store["names"]) < MIN_CATALOG_SIZE_FOR_GNN_TRAINING:
+            gnn_deferred = True
+            print(f"Catalog has only {len(store['names'])} pre-known objects "
+                  f"(< {MIN_CATALOG_SIZE_FOR_GNN_TRAINING}) -- deferring GNN training until "
+                  f"warm-up registers enough objects to train on. Gate-rejected detections "
+                  f"will register as new entries directly (fast-gate-only second opinion) "
+                  f"until then.")
         else:
             gnn_model = gnn_mod.load_or_train_model(
                 store,
@@ -349,8 +448,31 @@ def main():
     cat_sizes = list(np.asarray(store["sizes"], dtype=float))
     cat_rcs = list(np.asarray(store["rcs"], dtype=float))
     cat_epoch = list(np.asarray(store["epoch_seconds"], dtype=float))
+    # Confidence/age field (see ISSUES_AND_UPGRADE_PATH.md #3): number of
+    # corroborated updates this slot has received. Pre-known store entries
+    # start at a nominal confidence of 1 (they were seeded, not
+    # corroborated in-run, but they're not "brand new and unproven"
+    # either); freshly-registered entries also start at 1 (their one
+    # corroborating registration). Incremented on every committed
+    # resolve_update(); used by the de-duplication/retirement housekeeping
+    # pass to deprioritize/expire low-confidence entries.
+    cat_confidence = [1] * len(cat_names)
+    # Real-time (real_now) this slot was last associated with ANY detection
+    # (accepted match OR fresh registration) -- distinct from cat_epoch,
+    # which only advances on a COMMITTED belief-update. Used by the
+    # retirement rule (#3) and the maneuver/missed-pass detector (#2) to
+    # tell "not seen in a while" apart from "seen but update withheld
+    # pending corroboration."
+    cat_last_seen = list(cat_epoch)
+    # Retired slots (decayed out of orbit, or unseen too long -- see #3):
+    # moved out of the active working set, excluded from ann_index.rebuild()
+    # and from candidate search, but kept around (not deleted) so indices
+    # stay stable and diagnostics/logs can still reference them.
+    cat_retired = [False] * len(cat_names)
     discovery_counter = 0
     discovered_true_name = {}  # "discovered_N" -> the true object name it was created from
+    registration_committed_count = 0   # new-object registration actually minted this pass
+    registration_withheld_count = 0    # candidate registration pending corroboration
 
     # ANN index over the (growable, drifting) catalog -- see leo_ann_index.py.
     # Replaces the old per-detection full-catalog propagate+embed+brute-force
@@ -370,6 +492,43 @@ def main():
     # the SAME slot on two consecutive passes; otherwise it's a dangling
     # provisional guess that a mismatched next hit will simply overwrite.
     pending_update = {}
+
+    # Corroborated REGISTRATION state (see ISSUES_AND_UPGRADE_PATH.md #1):
+    # a GNN-confirmed "unknown" doesn't immediately mint a catalog entry --
+    # it stashes a candidate registration here, keyed by a coarse identity
+    # bucket (object type + a coarse quantization of the measured elements)
+    # so a second, independent detection that's plausibly the SAME physical
+    # object (not just any new unknown) can corroborate it. Only on that
+    # second agreeing observation does the candidate actually get appended
+    # to cat_names/cat_a/etc. This reuses the exact same "wait for a second
+    # agreeing observation" idea already proven out for belief updates
+    # (pending_update / resolve_update) -- applied one step earlier in the
+    # pipeline, before a slot even exists to update.
+    #
+    # Entry shape: bucket_key -> dict(meas_a, meas_e, meas_i, meas_raan,
+    # meas_argp, obj_type, size, rcs, real_now, true_name) -- the true_name
+    # field is diagnostics-only (ground truth), used purely to log whether
+    # corroboration correctly matched the same physical object or
+    # accidentally collided two different-but-nearby unknowns into one
+    # registration (a real system has no true_name to check this with, but
+    # WOULD still functionally corroborate correctly since the bucket key
+    # and identity-space proximity are derived from real measurements).
+    pending_registration = {}
+
+    def registration_bucket_key(obj_type, meas_a, meas_i, meas_raan):
+        """Coarse identity bucket for candidate-registration corroboration:
+        groups detections that are plausibly the same physical object
+        (same type, close semi-major axis, close inclination) without
+        needing an already-built ANN tree over not-yet-registered objects.
+        Quantization width chosen deliberately coarse relative to
+        measurement noise (MEASUREMENT_NOISE) so two detections of the
+        same true object reliably land in the same bucket, but far finer
+        than the gap between physically distinct objects -- RAAN is
+        excluded from the key itself (it precesses between passes) and
+        instead checked via a tolerance at corroboration time."""
+        a_bucket = round(meas_a / 5.0)      # 5 km bins
+        i_bucket = round(meas_i / 0.5)      # 0.5 deg bins
+        return (obj_type, a_bucket, i_bucket)
 
     true_name_to_idx = {n: i for i, n in enumerate(cat_names)}  # true name -> current catalog slot,
     # maintained incrementally as objects get discovered, so mismatch diagnostics can find
@@ -403,6 +562,15 @@ def main():
     gnn_new_discoveries = 0
     update_committed_count = 0     # belief-update actually written this pass
     update_withheld_count = 0      # accepted but update withheld pending corroboration
+
+    # Warm-up tracking (see ISSUES_AND_UPGRADE_PATH.md #1): registrations
+    # per detection, binned by sim-time, to sanity check that cold start
+    # actually behaves as expected -- lots of registrations early, dropping
+    # off as the catalog saturates -- rather than continuously registering
+    # duplicates throughout the run.
+    WARMUP_BIN_SECONDS = 10.0  # sim-seconds per reporting bin
+    warmup_bin_detections = {}     # bin_idx -> detection count
+    warmup_bin_registrations = {}  # bin_idx -> committed-registration count
 
     real_start = time.perf_counter()
 
@@ -454,6 +622,7 @@ def main():
             break
 
         real_now = sim_time * ACCELERATION_FACTOR  # real seconds elapsed since t=0
+        registration_committed_this_pass = False
 
         # --- propagate this object's TRUE trajectory forward to now ---
         dt_truth = real_now - truth_epoch[idx]
@@ -487,6 +656,24 @@ def main():
             # Rebuild the ANN tree periodically (amortized O(N) cost) rather
             # than on every detection -- see leo_ann_index.py.
             if ann_index.needs_rebuild():
+                # Cold-start scaler refit (see ISSUES_AND_UPGRADE_PATH.md
+                # #1): domain-default scalers are a placeholder prior, not
+                # a measurement. Once enough objects have been registered
+                # to fit real StandardScalers on, swap them in -- every
+                # consumer (transform_identity_vector, build_embeddings_fast,
+                # the ANN index via `scalers`) reads the `scalers` dict
+                # fresh each call, so replacing this one reference is all
+                # that's needed; no matching code changes.
+                if scalers.get("source") == "domain_default" and len(cat_a) >= MIN_CATALOG_SIZE_FOR_SCALER_REFIT:
+                    refitted = embed_mod.refit_scalers_in_place(cat_a, cat_e, cat_sizes, cat_rcs,
+                                                                  min_n=MIN_CATALOG_SIZE_FOR_SCALER_REFIT)
+                    if refitted is not None:
+                        scalers.clear()
+                        scalers.update(refitted)
+                        ann_index.scalers = scalers
+                        print(f"[T+{sim_time:7.2f}s sim] Refit scalers from {len(cat_a)} registered "
+                              f"objects (domain_default -> fitted).")
+
                 ann_index.rebuild(
                     cat_a, cat_e, cat_i, cat_raan, cat_argp, cat_bc,
                     cat_types, cat_sizes, cat_rcs, cat_epoch, real_now,
@@ -619,6 +806,25 @@ def main():
         gnn_registered = False
         name = names[idx]
 
+        # confirmed_unknown becomes True once every available second-opinion
+        # mechanism has had its say and none of them accepted -- this is
+        # the trigger for "try existing_slot correction, then registration"
+        # below. Two ways to get here:
+        #   (a) the GNN ran (n_cat > 0 and a trained model is available)
+        #       and it also rejected the detection, or
+        #   (b) there's no GNN second opinion to consult at all -- either
+        #       the catalog is empty (n_cat == 0, true cold start) or
+        #       training hasn't happened yet (gnn_model is None, deferred
+        #       per MIN_CATALOG_SIZE_FOR_GNN_TRAINING). In that case the
+        #       fast gate's reject is the only opinion there is, and
+        #       "not accepted" already means "confirmed unknown" -- this
+        #       must still flow into existing_slot/registration or the
+        #       catalog can never grow past its seed size while the GNN is
+        #       unavailable (a real bug: previously this whole branch was
+        #       gated on `gnn_model is not None`, so cold start's 0-object
+        #       catalog and any GNN-unavailable run never registered
+        #       anything at all).
+        confirmed_unknown = False
         if not accepted and n_cat > 0 and gnn_model is not None:
             gnn_used = True
             candidate_vecs = candidate_vecs_for_gnn
@@ -632,7 +838,14 @@ def main():
                 best_idx = int(top5[gnn_local_idx])
                 best_dist = candidate_dists[gnn_local_idx]
             else:
-                # CONFIRMED UNKNOWN by both the gate and the GNN. Before minting
+                confirmed_unknown = True
+        elif not accepted:
+            # No GNN second opinion available this pass (empty catalog, or
+            # training deferred/unavailable) -- the gate's reject is final.
+            confirmed_unknown = True
+
+        if confirmed_unknown:
+                # CONFIRMED UNKNOWN by every available check. Before minting
                 # a brand-new entry, check whether this true object was already
                 # discovered on an earlier pass -- if the gate/GNN reject it
                 # again (e.g. propagation drift outran the catalog's belief, or
@@ -652,36 +865,109 @@ def main():
                 # correct, so it still goes through the same corroboration
                 # gate as every other path rather than writing immediately.
                 existing_idx = true_name_to_idx.get(name)
-                if existing_idx is not None and existing_idx < len(cat_names):
+                # existing_idx can only be non-None if this true object was
+                # already registered on an earlier pass, which requires
+                # n_cat > 0 (and therefore unweighted_dist_for to exist) --
+                # n_cat == 0 (true cold start, nothing registered yet)
+                # always has existing_idx is None, so the n_cat > 0 guard
+                # here is a defensive invariant check, not a normal-path
+                # branch.
+                if existing_idx is not None and existing_idx < len(cat_names) and n_cat > 0:
                     gnn_registered = False
                     best_idx = existing_idx
                     accepted = True
                     accept_path = "existing_slot"
                     best_dist = unweighted_dist_for(existing_idx)
                 else:
-                    gnn_registered = True
-                    new_name = f"discovered_{discovery_counter}"
-                    discovery_counter += 1
-                    discovered_true_name[new_name] = name
-                    true_name_to_idx[name] = len(cat_names)  # this will be its index once appended below
-                    cat_names.append(new_name)
-                    cat_a.append(meas_a); cat_e.append(meas_e); cat_i.append(meas_i)
-                    cat_raan.append(meas_raan); cat_argp.append(meas_argp)
-                    cat_bc.append(op.ballistic_coefficient(sizes[idx], types[idx]))
-                    cat_types.append(types[idx]); cat_sizes.append(sizes[idx]); cat_rcs.append(rcs_vals[idx])
-                    cat_epoch.append(real_now)
-                    # a freshly registered entry has no prior belief to
-                    # corrupt -- no need to route it through resolve_update.
-                    # It DOES need to be visible to the ANN index before the
-                    # tree's next rebuild, though -- stash it in the overflow
-                    # buffer so subsequent detections can match against it.
-                    ann_index.mark_dirty(len(cat_names) - 1)
+                    # CONFIRMED UNKNOWN by both gate and GNN, and no
+                    # existing slot for this true object -- this is a
+                    # genuine new-object candidate. Route it through the
+                    # SAME corroboration idea used for belief updates
+                    # (REGISTRATION_CONFIRMATIONS_REQUIRED, default 2):
+                    # don't mint a catalog slot on a single uncertain call
+                    # -- stash it as a pending registration, and only
+                    # commit once a second detection lands in the same
+                    # coarse identity bucket AND close enough in full
+                    # identity-space to plausibly be the same physical
+                    # object. See ISSUES_AND_UPGRADE_PATH.md #1: at cold
+                    # start, essentially 100% of early detections take this
+                    # path, so this is exactly the mechanism that needs
+                    # corroboration most.
+                    bucket_key = registration_bucket_key(types[idx], meas_a, meas_i, meas_raan)
+
+                    if REGISTRATION_CONFIRMATIONS_REQUIRED <= 1:
+                        commit_registration = True
+                    else:
+                        prior = pending_registration.get(bucket_key)
+                        if prior is not None:
+                            # Same bucket seen before -- check the two
+                            # detections are actually close in identity
+                            # space too (the coarse bucket alone isn't
+                            # enough to rule out two distinct objects that
+                            # happen to share a bucket). Reuse the same
+                            # DRIFT_TOLERANCE the fast gate trusts for "is
+                            # this plausibly one object" -- no new
+                            # threshold needed.
+                            prior_vec = embed_mod.transform_identity_vector(
+                                prior["meas_a"], prior["meas_e"], prior["meas_i"],
+                                prior["meas_raan"], prior["meas_argp"],
+                                prior["obj_type"], prior["size"], prior["rcs"], scalers,
+                            )
+                            this_vec = embed_mod.transform_identity_vector(
+                                meas_a, meas_e, meas_i, meas_raan, meas_argp,
+                                types[idx], sizes[idx], rcs_vals[idx], scalers,
+                            )
+                            corroboration_dist = float(np.linalg.norm(
+                                (prior_vec - this_vec) * distance_weights
+                            ))
+                            commit_registration = corroboration_dist < drift_tolerance
+                        else:
+                            commit_registration = False
+
+                    if commit_registration:
+                        gnn_registered = True
+                        new_name = f"discovered_{discovery_counter}"
+                        discovery_counter += 1
+                        discovered_true_name[new_name] = name
+                        true_name_to_idx[name] = len(cat_names)  # this will be its index once appended below
+                        cat_names.append(new_name)
+                        cat_a.append(meas_a); cat_e.append(meas_e); cat_i.append(meas_i)
+                        cat_raan.append(meas_raan); cat_argp.append(meas_argp)
+                        cat_bc.append(op.ballistic_coefficient(sizes[idx], types[idx]))
+                        cat_types.append(types[idx]); cat_sizes.append(sizes[idx]); cat_rcs.append(rcs_vals[idx])
+                        cat_epoch.append(real_now)
+                        cat_confidence.append(1)  # first corroborated hit -- see #3/#4
+                        cat_last_seen.append(real_now)
+                        # a freshly registered entry has no prior belief to
+                        # corrupt -- no need to route it through resolve_update.
+                        # It DOES need to be visible to the ANN index before the
+                        # tree's next rebuild, though -- stash it in the overflow
+                        # buffer so subsequent detections can match against it.
+                        ann_index.mark_dirty(len(cat_names) - 1)
+                        pending_registration.pop(bucket_key, None)
+                        registration_committed_count += 1
+                        registration_committed_this_pass = True
+                    else:
+                        gnn_registered = False
+                        pending_registration[bucket_key] = {
+                            "meas_a": meas_a, "meas_e": meas_e, "meas_i": meas_i,
+                            "meas_raan": meas_raan, "meas_argp": meas_argp,
+                            "obj_type": types[idx], "size": sizes[idx], "rcs": rcs_vals[idx],
+                            "real_now": real_now, "true_name": name,
+                        }
+                        registration_withheld_count += 1
 
         t1 = time.perf_counter()
         elapsed_us = (t1 - t0) * 1_000_000
 
         total_detections += 1
         obj_type = types[idx]
+
+        # Warm-up bin bookkeeping (see ISSUES_AND_UPGRADE_PATH.md #1).
+        warmup_bin = int(sim_time // WARMUP_BIN_SECONDS)
+        warmup_bin_detections[warmup_bin] = warmup_bin_detections.get(warmup_bin, 0) + 1
+        if registration_committed_this_pass:
+            warmup_bin_registrations[warmup_bin] = warmup_bin_registrations.get(warmup_bin, 0) + 1
 
         update_committed = False
         if accepted:
@@ -767,6 +1053,11 @@ def main():
         path_flag = ""
         if not accepted and gnn_registered:
             path_flag = "  [registered new]"
+        elif not accepted and gnn_used and not gnn_registered and n_cat >= 0 and accept_path is None:
+            # GNN confirmed unknown but registration is pending corroboration
+            # (see REGISTRATION_CONFIRMATIONS_REQUIRED) -- distinguish this
+            # from a plain "not known" so warm-up behavior is legible in logs.
+            path_flag = "  [pending registration, awaiting corroboration]"
         elif accepted:
             commit_tag = "committed" if update_committed else "withheld, pending corroboration"
             if accept_path == "gate":
@@ -807,8 +1098,13 @@ def main():
     if USE_GNN_CONFIRMATION:
         print(f"  GNN overturned to KNOWN  : {gnn_confirmed_known}")
         print(f"  GNN confirmed unknown -> new catalog entries: {gnn_new_discoveries}")
+        print(f"  Registrations committed : {registration_committed_count}")
+        print(f"  Registrations withheld  : {registration_withheld_count} (pending corroboration)")
         print(f"  Catalog size: {len(store['names'])} -> {len(cat_names)} "
               f"(+{len(cat_names) - len(store['names'])})")
+    if len(store["names"]) < MIN_CATALOG_SIZE_FOR_CALIBRATION or gnn_deferred:
+        print(f"  Cold-start / warm-up run: started from {len(store['names'])} pre-known "
+              f"objects (scalers source={scalers.get('source', 'fitted')}).")
     print(f"Real wall-clock time spent : {real_elapsed*1000:.3f} ms")
     print()
     if match_distances:
@@ -821,6 +1117,17 @@ def main():
     print(f"{'ALL':<10}{avg_all:>12.3f}{fast_all:>16.3f}{slow_all:>16.3f}")
     print(f"{'KNOWN':<10}{avg_k:>12.3f}{fast_k:>16.3f}{slow_k:>16.3f}")
     print(f"{'UNKNOWN':<10}{avg_u:>12.3f}{fast_u:>16.3f}{slow_u:>16.3f}")
+
+    if warmup_bin_detections:
+        print("\nWarm-up phase (registrations per detection over time, "
+              f"{WARMUP_BIN_SECONDS:.0f}s bins):")
+        for b in sorted(warmup_bin_detections):
+            det = warmup_bin_detections[b]
+            reg = warmup_bin_registrations.get(b, 0)
+            rate = reg / det * 100 if det else 0.0
+            bar = "#" * min(int(rate / 2), 50)
+            print(f"  t=[{b*WARMUP_BIN_SECONDS:6.0f}s,{(b+1)*WARMUP_BIN_SECONDS:6.0f}s)  "
+                  f"detections={det:<6} registrations={reg:<5} rate={rate:5.1f}%  {bar}")
 
     print("\nPer-type breakdown (known / not known):")
     all_types = sorted(set(per_type_known) | set(per_type_unknown))
