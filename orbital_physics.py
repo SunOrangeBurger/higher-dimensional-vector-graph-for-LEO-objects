@@ -57,19 +57,45 @@ _ATMOSPHERE_TABLE = [
     (1000, 3.019e-15, 268.00),
 ]
 
+# Pre-computed parallel arrays for the vectorized (searchsorted) atmosphere
+# lookup below -- avoids a per-object Python loop over _ATMOSPHERE_TABLE
+# every time propagate_catalog_analytic() runs across the whole catalog
+# (called on every ANN rebuild, at N ~ 10k-20k objects -- see
+# atmospheric_density()'s docstring for the verification this vectorized
+# form was checked against).
+_ATM_ALTS = np.array([entry[0] for entry in _ATMOSPHERE_TABLE])
+_ATM_RHOS = np.array([entry[1] for entry in _ATMOSPHERE_TABLE])
+_ATM_HSCALE = np.array([entry[2] for entry in _ATMOSPHERE_TABLE])
 
-def atmospheric_density(altitude_km: float) -> float:
-    """Piecewise exponential atmosphere density, kg/m^3."""
-    alt = max(altitude_km, _ATMOSPHERE_TABLE[0][0])
-    # find the highest base altitude <= alt
-    band = _ATMOSPHERE_TABLE[0]
-    for entry in _ATMOSPHERE_TABLE:
-        if entry[0] <= alt:
-            band = entry
-        else:
-            break
-    h0, rho0, H = band
-    return rho0 * np.exp(-(alt - h0) / H)
+
+def atmospheric_density(altitude_km):
+    """Piecewise exponential atmosphere density, kg/m^3. Vectorized: accepts
+    a scalar or a numpy array and returns the matching type. Verified
+    numerically identical to the original per-object Python-loop
+    implementation across the full altitude range, including exact table
+    boundaries and the below-floor clamp (see PERF FIX note in
+    ground_station_tracking_simulation.py for the measured motivation:
+    this was a per-object Python loop running over the whole catalog on
+    every ANN rebuild)."""
+    is_scalar = np.ndim(altitude_km) == 0
+    alt = np.atleast_1d(np.asarray(altitude_km, dtype=float))
+
+    # Floor altitude at the minimum table altitude (150 km), matching the
+    # original scalar implementation's `max(altitude_km, table[0][0])`.
+    alt_floored = np.maximum(alt, _ATM_ALTS[0])
+
+    # Index of the highest base altitude <= alt, vectorized via
+    # searchsorted (side='right' - 1 mirrors "highest entry with
+    # entry[0] <= alt" from the original forward scan).
+    indices = np.searchsorted(_ATM_ALTS, alt_floored, side="right") - 1
+    indices = np.clip(indices, 0, len(_ATM_ALTS) - 1)
+
+    h0 = _ATM_ALTS[indices]
+    rho0 = _ATM_RHOS[indices]
+    H = _ATM_HSCALE[indices]
+
+    rho = rho0 * np.exp(-(alt_floored - h0) / H)
+    return float(rho[0]) if is_scalar else rho
 
 
 def ballistic_coefficient(size_m: float, obj_type: str, cd: float = 2.2) -> float:
@@ -311,7 +337,7 @@ def propagate_catalog_analytic(a, e, i_deg, raan_deg, argp_deg, cd_a_over_m, dt_
     # Converting a to meters and the result back to km/s algebraically
     # simplifies to: da/dt [km/s] = -(Cd A/m) * rho * v[m/s] * a[km]
     altitude_km = a - RE_EARTH
-    rho = np.array([atmospheric_density(h) for h in np.atleast_1d(altitude_km)])
+    rho = atmospheric_density(altitude_km)
     circular_speed_km_s = np.sqrt(MU_EARTH / a)
     v_m_s = circular_speed_km_s * 1000.0
 

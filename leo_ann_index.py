@@ -64,6 +64,14 @@ STRATEGY
     dirty slots are corrected in the small per-query candidate propagation
     step regardless of tree staleness, since they're always included via
     the overflow-adjacent "recently touched" set.
+  - Retired slots (decayed out of orbit, or unseen for too long -- see the
+    retirement housekeeping pass in ground_station_tracking_simulation.py)
+    are excluded from the tree at the next rebuild, AND filtered out of
+    live query results immediately (not just at the next rebuild) via an
+    optional cat_retired mask passed to both rebuild() and
+    query_candidates() -- otherwise a slot retired mid-cycle would remain
+    a valid ANN candidate (silently untouched in the tree) until the next
+    scheduled rebuild.
 
 This turns the per-detection cost from O(N) propagate + O(N) embed +
 O(N) distance into O(K log N) tree query + O(K) propagate/embed/distance
@@ -144,24 +152,55 @@ class LiveCatalogANNIndex:
     # -----------------------------------------------------------------
     def rebuild(self, cat_a, cat_e, cat_i, cat_raan, cat_argp, cat_bc,
                 cat_types, cat_sizes, cat_rcs, cat_epoch, real_now,
-                distance_weights):
+                distance_weights, cat_retired=None):
         """Full O(N) propagate + embed + tree-build. Called periodically,
-        not per-detection -- this is what amortizes the O(N) cost."""
+        not per-detection -- this is what amortizes the O(N) cost.
+
+        cat_retired (optional, bool array/list, len == n_cat): retired
+        slots (decayed out of orbit, or unseen for too long -- see the
+        retirement housekeeping pass in ground_station_tracking_simulation.py)
+        are excluded from the tree entirely, so they can never surface as
+        an ANN candidate after a rebuild. If omitted, all entries are
+        treated as active (matches pre-retirement behavior exactly)."""
         n_cat = len(cat_a)
-        cat_a_arr = np.asarray(cat_a, dtype=float)
-        cat_e_arr = np.asarray(cat_e, dtype=float)
-        cat_i_arr = np.asarray(cat_i, dtype=float)
-        cat_raan_arr = np.asarray(cat_raan, dtype=float)
-        cat_argp_arr = np.asarray(cat_argp, dtype=float)
-        cat_bc_arr = np.asarray(cat_bc, dtype=float)
-        cat_epoch_arr = np.asarray(cat_epoch, dtype=float)
+
+        if cat_retired is not None:
+            active_mask = ~np.asarray(cat_retired[:n_cat], dtype=bool)
+        else:
+            active_mask = np.ones(n_cat, dtype=bool)
+
+        active_indices = np.where(active_mask)[0]
+
+        cat_a_arr = np.asarray(cat_a, dtype=float)[active_indices]
+        cat_e_arr = np.asarray(cat_e, dtype=float)[active_indices]
+        cat_i_arr = np.asarray(cat_i, dtype=float)[active_indices]
+        cat_raan_arr = np.asarray(cat_raan, dtype=float)[active_indices]
+        cat_argp_arr = np.asarray(cat_argp, dtype=float)[active_indices]
+        cat_bc_arr = np.asarray(cat_bc, dtype=float)[active_indices]
+        cat_epoch_arr = np.asarray(cat_epoch, dtype=float)[active_indices]
+        cat_types_active = [cat_types[j] for j in active_indices]
+        cat_sizes_arr = np.asarray(cat_sizes, dtype=float)[active_indices]
+        cat_rcs_arr = np.asarray(cat_rcs, dtype=float)[active_indices]
+
+        n_active = len(active_indices)
+        if n_active == 0:
+            # Entire catalog retired (degenerate, but handle cleanly rather
+            # than crash) -- every query falls back to "no candidates" via
+            # query_candidates' own n_active==0 guard below.
+            self._tree = None
+            self._tree_indices = np.array([], dtype=int)
+            self._tree_reference_time = real_now
+            self._detections_since_rebuild = 0
+            self._overflow_indices = []
+            self.n_rebuilds += 1
+            return
 
         dt_cat = real_now - cat_epoch_arr
         prop_a, prop_e, prop_i, prop_raan, prop_argp = op.propagate_catalog_analytic(
             cat_a_arr, cat_e_arr, cat_i_arr, cat_raan_arr, cat_argp_arr, cat_bc_arr, dt_cat
         )
         vectors = embed_mod.build_embeddings_fast(
-            prop_a, prop_e, prop_i, prop_raan, prop_argp, cat_types, cat_sizes, cat_rcs, self.scalers
+            prop_a, prop_e, prop_i, prop_raan, prop_argp, cat_types_active, cat_sizes_arr, cat_rcs_arr, self.scalers
         )
         weighted_vectors = vectors * distance_weights
 
@@ -169,10 +208,13 @@ class LiveCatalogANNIndex:
         # our dimensionality (13) is low and query batches are tiny (1 at
         # a time) -- doesn't materially matter at this N, kept at default
         # behavior via "auto" so sklearn picks kd_tree/ball_tree itself.
-        n_neighbors = min(self.candidate_pool_size, n_cat)
+        n_neighbors = min(self.candidate_pool_size, n_active)
         self._tree = NearestNeighbors(n_neighbors=n_neighbors, algorithm="auto")
         self._tree.fit(weighted_vectors)
-        self._tree_indices = np.arange(n_cat)
+        # _tree_indices maps tree-local position -> ABSOLUTE catalog index,
+        # so kneighbors() results translate back correctly even though the
+        # tree itself only ever saw the active subset.
+        self._tree_indices = active_indices
         self._tree_reference_time = real_now
 
         self._detections_since_rebuild = 0
@@ -180,27 +222,56 @@ class LiveCatalogANNIndex:
         self.n_rebuilds += 1
 
     # -----------------------------------------------------------------
-    def query_candidates(self, weighted_query_vec, n_cat):
+    def query_candidates(self, weighted_query_vec, n_cat, cat_retired=None):
         """Return a sorted-by-nothing-in-particular array of candidate
         catalog indices: the ANN tree's nearest CANDIDATE_POOL_SIZE plus
-        the current overflow buffer, deduplicated. Exact re-ranking of
-        these candidates (propagate-to-exact-epoch, exact distance) is the
-        caller's job -- this method only narrows the search space.
+        the current overflow buffer, deduplicated, with retired slots
+        excluded from both. Exact re-ranking of these candidates
+        (propagate-to-exact-epoch, exact distance) is the caller's job --
+        this method only narrows the search space.
 
-        Falls back to "every catalog index" if the tree doesn't exist yet
-        (e.g. very first detections before any rebuild has happened) or if
-        n_cat is small enough that brute force is already cheap/exact.
+        cat_retired (optional): filters out slots retired SINCE the last
+        rebuild. The tree itself already excludes slots that were retired
+        AS OF the last rebuild (see rebuild() above) -- this second check
+        is what closes the gap where a slot retired mid-cycle would
+        otherwise still surface as a candidate (it remains in the tree,
+        untouched, until the next rebuild). Passing the same cat_retired
+        here that housekeeping maintains live is what makes retirement
+        take effect immediately rather than up to `rebuild_every`
+        detections late.
+
+        Falls back to "every non-retired catalog index" if the tree
+        doesn't exist yet (e.g. very first detections before any rebuild
+        has happened) or if n_cat is small enough that brute force is
+        already cheap/exact.
         """
         self._detections_since_rebuild += 1
+
+        if cat_retired is not None:
+            retired_arr = np.asarray(cat_retired[:n_cat], dtype=bool)
+        else:
+            retired_arr = None
 
         if self._tree is None or n_cat <= self.candidate_pool_size:
             # Catalog too small for ANN to be worth it, or no tree yet --
             # brute force over everything is both cheap and exact here.
-            return np.arange(n_cat)
+            all_idx = np.arange(n_cat)
+            if retired_arr is not None:
+                all_idx = all_idx[~retired_arr[all_idx]]
+            return all_idx
 
         k = min(self.candidate_pool_size, len(self._tree_indices))
-        _, neighbor_pos = self._tree.kneighbors(weighted_query_vec[None, :], n_neighbors=k)
-        tree_candidates = self._tree_indices[neighbor_pos[0]]
+        if k == 0:
+            # Every indexed slot was retired at last rebuild (n_active==0
+            # in rebuild()) -- nothing to return from the tree; overflow
+            # buffer (new registrations since then) may still have live
+            # candidates, handled below.
+            tree_candidates = np.array([], dtype=int)
+        else:
+            _, neighbor_pos = self._tree.kneighbors(weighted_query_vec[None, :], n_neighbors=k)
+            tree_candidates = self._tree_indices[neighbor_pos[0]]
+            if retired_arr is not None:
+                tree_candidates = tree_candidates[~retired_arr[tree_candidates]]
 
         if self._overflow_indices:
             self.n_overflow_scans += 1
@@ -209,6 +280,8 @@ class LiveCatalogANNIndex:
             # always true in practice since indices are only ever appended,
             # but guards against any future refactor that reuses slots.
             overflow_arr = overflow_arr[overflow_arr < n_cat]
+            if retired_arr is not None:
+                overflow_arr = overflow_arr[~retired_arr[overflow_arr]]
             candidates = np.union1d(tree_candidates, overflow_arr)
         else:
             candidates = tree_candidates
